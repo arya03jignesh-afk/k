@@ -398,7 +398,9 @@ class Win32API:
         self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         return int(pid.value) if pid.value else None
 
-    def process_executable_name(self, pid_value: int) -> Optional[str]:
+    def process_executable_name(self, pid_value: Optional[int]) -> Optional[str]:
+        if pid_value is None or pid_value <= 0:
+            return None
         # PROCESS_QUERY_LIMITED_INFORMATION works for ordinary same-user process
         # identification and generally avoids requiring administrator privileges.
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -412,9 +414,9 @@ class Win32API:
             ok = self.kernel32.QueryFullProcessImageNameW(
                 process_handle, 0, buffer, ctypes.byref(size)
             )
-            if not ok:
+            if not ok or size.value == 0:
                 return None
-            return os.path.basename(buffer.value).casefold()
+            return os.path.basename(buffer.value[: size.value]).casefold()
         finally:
             self.kernel32.CloseHandle(process_handle)
 
@@ -566,7 +568,6 @@ class Win32KeyboardHook:
                 self._monitor_thread.join(timeout=1.0)
             self._ready.set()
 
-    
     def _monitor_foreground_process(self) -> None:
         api = self._api
         if api is None:
@@ -589,7 +590,7 @@ class Win32KeyboardHook:
 
     def _on_keyboard_message(self, n_code: int, w_param: int, l_param: int) -> int:
         api = self._api
-        if api is None:
+        if api is None or self._hook_handle is None:
             return 0
         try:
             if n_code == self.HC_ACTION:
