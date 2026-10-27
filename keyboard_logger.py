@@ -19,10 +19,10 @@ from typing import Optional, Sequence
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox
-except Exception:  # A missing Tcl/Tk installation should produce a clear error.
-    tk = None  # type: ignore[assignment]
-    filedialog = None  # type: ignore[assignment]
-    messagebox = None  # type: ignore[assignment]
+except Exception:
+    tk = None
+    filedialog = None
+    messagebox = None
 
 
 APP_TITLE = "Multi-APP Keyboard Event Logger"
@@ -40,8 +40,6 @@ TEXT_COLUMNS = (
 )
 _STOP = object()
 
-
-# Common Windows virtual-key identifiers. Unlisted keys use VK_0xNN notation.
 _VK_NAMES = {
     0x03: "CANCEL",
     0x08: "BACKSPACE",
@@ -99,7 +97,6 @@ _VK_NAMES = {
 
 
 def key_name_from_vk(vk_code: int) -> str:
-    """Return a stable, layout-independent label for a Windows virtual key."""
     if 0x30 <= vk_code <= 0x39:
         return chr(vk_code)
     if 0x41 <= vk_code <= 0x5A:
@@ -114,7 +111,6 @@ def key_name_from_vk(vk_code: int) -> str:
 
 
 def utc_iso_timestamp(value: Optional[datetime] = None) -> str:
-    """ISO 8601 UTC timestamp with six fractional digits and a Z suffix."""
     moment = value or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
@@ -122,7 +118,6 @@ def utc_iso_timestamp(value: Optional[datetime] = None) -> str:
 
 
 def elapsed_milliseconds(start_ns: int, event_ns: int) -> str:
-    """Format monotonic elapsed time as milliseconds with microsecond display precision."""
     return f"{max(0, event_ns - start_ns) / 1_000_000:.3f}"
 
 
@@ -137,8 +132,6 @@ class CapturedRecord:
 
 
 class RecordingSession:
-    """Thread-safe session state and asynchronous plain-text log writer."""
-
     def __init__(self, output_directory: Path):
         output_directory = output_directory.expanduser()
         output_directory.mkdir(parents=True, exist_ok=True)
@@ -164,22 +157,9 @@ class RecordingSession:
         self._stopping = False
         self._writer_error: Optional[str] = None
         self._writer_done = threading.Event()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name=f"TextWriter-{self.session_id}",
-            daemon=True,
-        )
+        self._writer_thread = threading.Thread(target=self._writer_loop, name=f"TextWriter-{self.session_id}", daemon=True)
         self._writer_thread.start()
-        self._queue.put(
-            CapturedRecord(
-                self._make_row(
-                    record_type="session_start",
-                    mono_ns=self.start_monotonic_ns,
-                    utc_timestamp=utc_iso_timestamp(self.started_utc),
-                    notes="Logging all keyboard events to plain text.",
-                )
-            )
-        )
+        self._queue.put(CapturedRecord(self._make_row(record_type="session_start", mono_ns=self.start_monotonic_ns, utc_timestamp=utc_iso_timestamp(self.started_utc), notes="Logging all keyboard events to plain text.")))
 
     def _make_row(
         self,
@@ -208,7 +188,6 @@ class RecordingSession:
         )
 
     def record_keyboard_event(self, event_type: str, vk_code: int) -> bool:
-        """Queue one event; logs all keys without any app filtering."""
         if event_type not in ("key_down", "key_up"):
             return False
         with self._lock:
@@ -274,13 +253,11 @@ class RecordingSession:
                 except queue.Empty:
                     self._file.flush()
                     continue
-
                 if item is _STOP:
                     self._file.flush()
                     break
                 if not isinstance(item, CapturedRecord):
                     continue
-
                 self._file.write(_format_text_row(item.row) + "\n")
                 self._file.flush()
         except Exception as exc:
@@ -308,23 +285,13 @@ class RecordingSession:
                 stop_mono = time.monotonic_ns()
                 self._end_monotonic_ns = stop_mono
                 if not self._writer_done.is_set():
-                    row = self._make_row(
-                        record_type="session_end",
-                        mono_ns=stop_mono,
-                        utc_timestamp=utc_iso_timestamp(stop_utc),
-                        notes=reason,
-                    )
+                    row = self._make_row(record_type="session_end", mono_ns=stop_mono, utc_timestamp=utc_iso_timestamp(stop_utc), notes=reason)
                     self._queue.put(CapturedRecord(row))
                     self._queue.put(_STOP)
         self._writer_thread.join()
 
 
-# ---------------- Windows foreground identification and keyboard hook --------
-
-
 class Win32API:
-    """Thin ctypes wrappers around the Windows APIs used by the application."""
-
     def __init__(self) -> None:
         if os.name != "nt":
             raise OSError("Keyboard capture is available only on Windows.")
@@ -407,21 +374,11 @@ class Win32API:
         return self.process_executable_name(pid_value) if pid_value else None
 
 
-_API: Optional[Win32API] = None
-_API_LOCK = threading.Lock()
-
-
 def get_win_api() -> Win32API:
-    global _API
-    if _API is None:
-        with _API_LOCK:
-            if _API is None:
-                _API = Win32API()
-    return _API
+    return Win32API()
 
 
 def is_target_app_foreground() -> bool:
-    """App filtering is intentionally disabled for full capture."""
     return True
 
 
@@ -436,8 +393,6 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 
 
 class Win32KeyboardHook:
-    """Run WH_KEYBOARD_LL on its own thread with a Windows message loop."""
-
     WH_KEYBOARD_LL = 13
     HC_ACTION = 0
     WM_KEYDOWN = 0x0100
@@ -483,6 +438,7 @@ class Win32KeyboardHook:
             msg = wintypes.MSG()
             api.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, self.PM_NOREMOVE)
             module_handle = api.kernel32.GetModuleHandleW(None)
+
             api.user32.SetWindowsHookExW.argtypes = [
                 ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32
             ]
@@ -493,23 +449,20 @@ class Win32KeyboardHook:
                 module_handle,
                 0,
             )
+
             if not handle:
                 error_code = ctypes.get_last_error()
                 self.error = (
-                    "SetWindowsHookExW failed. Windows error "
-                    f"{error_code}: {ctypes.FormatError(error_code).strip()}"
+                    f"SetWindowsHookExW failed. Windows error {error_code}: {ctypes.FormatError(error_code).strip()}"
                 )
                 self._ready.set()
                 return
 
             self._hook_handle = handle
-            self._monitor_thread = threading.Thread(
-                target=self._monitor_foreground_process,
-                name="ForegroundProcessMonitor",
-                daemon=True,
-            )
+            self._monitor_thread = threading.Thread(target=self._monitor_foreground_process, name="ForegroundProcessMonitor", daemon=True)
             self._monitor_thread.start()
             self._ready.set()
+
             while True:
                 result = api.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if result == 0:
@@ -517,8 +470,7 @@ class Win32KeyboardHook:
                 if result == -1:
                     error_code = ctypes.get_last_error()
                     self.error = (
-                        "The keyboard-hook message loop failed. Windows error "
-                        f"{error_code}: {ctypes.FormatError(error_code).strip()}"
+                        f"The keyboard-hook message loop failed. Windows error {error_code}: {ctypes.FormatError(error_code).strip()}"
                     )
                     break
                 api.user32.TranslateMessage(ctypes.byref(msg))
@@ -559,9 +511,7 @@ class Win32KeyboardHook:
                 if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN, self.WM_KEYUP, self.WM_SYSKEYUP):
                     key_data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                     if not (key_data.flags & self.LLKHF_INJECTED):
-                        event_type = (
-                            "key_down" if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) else "key_up"
-                        )
+                        event_type = "key_down" if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) else "key_up"
                         self.session.record_keyboard_event(event_type, int(key_data.vkCode))
         except Exception as exc:
             if self.callback_error is None:
@@ -585,9 +535,6 @@ class Win32KeyboardHook:
             self._monitor_thread.join(timeout=1.0)
 
 
-# ------------------------------ Tkinter GUI ----------------------------------
-
-
 class KeyboardLoggerApp:
     def __init__(self, root) -> None:
         self.root = root
@@ -596,7 +543,7 @@ class KeyboardLoggerApp:
         self.root.minsize(620, 430)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        default_output = Path.home() / "Documents" / "KeyLogs"
+        default_output = Path(r"D:\All phy\New folder")
         self.output_directory_var = tk.StringVar(value=str(default_output))
         self.status_var = tk.StringVar(value="Stopped")
         self.timer_var = tk.StringVar(value="00:00:00.000")
@@ -663,24 +610,13 @@ class KeyboardLoggerApp:
 
         buttons = tk.Frame(outer)
         buttons.pack(fill="x", pady=(3, 10))
-        self.start_button = tk.Button(
-            buttons, text="Start Recording", command=self._start_recording, width=18, height=2
-        )
+        self.start_button = tk.Button(buttons, text="Start Recording", command=self._start_recording, width=18, height=2)
         self.start_button.pack(side="left")
-        self.stop_button = tk.Button(
-            buttons, text="Stop Recording", command=self._stop_recording, width=18, height=2, state="disabled"
-        )
+        self.stop_button = tk.Button(buttons, text="Stop Recording", command=self._stop_recording, width=18, height=2, state="disabled")
         self.stop_button.pack(side="left", padx=(10, 0))
 
-        tk.Label(outer, textvariable=self.detail_var, fg="#444444", wraplength=640, justify="left").pack(
-            anchor="w", pady=(3, 0)
-        )
-        tk.Label(
-            outer,
-            fg="#7a3b00",
-            wraplength=640,
-            justify="left",
-        ).pack(anchor="w", pady=(8, 0))
+        tk.Label(outer, textvariable=self.detail_var, fg="#444444", wraplength=640, justify="left").pack(anchor="w", pady=(3, 0))
+        tk.Label(outer, fg="#7a3b00", wraplength=640, justify="left").pack(anchor="w", pady=(8, 0))
 
     def _browse_directory(self) -> None:
         selected = filedialog.askdirectory(
@@ -820,8 +756,6 @@ class KeyboardLoggerApp:
 
 
 def run_self_tests() -> bool:
-    """Small cross-platform integration tests for timestamps and plain-text logging."""
-
     class LoggerTests(unittest.TestCase):
         def test_key_names(self):
             self.assertEqual(key_name_from_vk(0x57), "W")
@@ -882,10 +816,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if run_self_tests() else 1
 
     if tk is None:
-        print(
-            "Tkinter is not available in this Python installation. Install Python with Tcl/Tk support.",
-            file=sys.stderr,
-        )
+        print("Tkinter is not available in this Python installation. Install Python with Tcl/Tk support.", file=sys.stderr)
         return 2
 
     try:
@@ -893,6 +824,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         print(f"Could not open the Tkinter GUI: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+
     KeyboardLoggerApp(root)
     root.mainloop()
     return 0
