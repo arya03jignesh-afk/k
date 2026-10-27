@@ -27,11 +27,7 @@ except Exception:  # A missing Tcl/Tk installation should produce a clear error.
 
 
 APP_TITLE = "Multi-APP Keyboard Event Logger"
-TARGET_EXECUTABLES = (
-    "msedge.exe",
-    "chrome.exe",
-    "notepad.exe",
-)
+TARGET_EXECUTABLES = ()
 CSV_COLUMNS = (
     "session_id",
     "event_index",
@@ -106,7 +102,7 @@ _VK_NAMES = {
 
 def key_name_from_vk(vk_code: int) -> str:
     """Return a stable, layout-independent label for a Windows virtual key."""
-    if 0x30 <= vk_code <= 0x39:  # Top-row digits
+    if 0x30 <= vk_code <= 0x39:
         return chr(vk_code)
     if 0x41 <= vk_code <= 0x5A:
         return chr(vk_code)
@@ -132,13 +128,18 @@ def elapsed_milliseconds(start_ns: int, event_ns: int) -> str:
     return f"{max(0, event_ns - start_ns) / 1_000_000:.3f}"
 
 
+def _format_txt_row(row: tuple[str, ...]) -> str:
+    values = dict(zip(CSV_COLUMNS, row))
+    return " | ".join(f"{key}={values.get(key, '')}" for key in CSV_COLUMNS)
+
+
 @dataclass(frozen=True)
 class CapturedRecord:
     row: tuple[str, ...]
 
 
 class RecordingSession:
-    """Thread-safe session state and asynchronous CSV writer."""
+    """Thread-safe session state and asynchronous plain-text log writer."""
 
     def __init__(self, output_directory: Path):
         output_directory = output_directory.expanduser()
@@ -149,13 +150,11 @@ class RecordingSession:
         started_utc = datetime.now(timezone.utc)
         short_id = uuid.uuid4().hex[:8]
         self.session_id = f"session_{started_utc.strftime('%Y%m%d_%H%M%S')}_{short_id}"
-        filename = f"keylogger_{started_utc.strftime('%Y%m%d_%H%M%S')}_{short_id}.csv"
+        filename = f"keylogger_{started_utc.strftime('%Y%m%d_%H%M%S')}_{short_id}.txt"
         self.path = output_directory / filename
 
-        # Exclusive creation ensures this session never overwrites an older CSV.
         self._file = self.path.open("x", encoding="utf-8", newline="")
-        self._csv = csv.writer(self._file, lineterminator="\n")
-        self._csv.writerow(CSV_COLUMNS)
+        self._file.write(_format_txt_row(tuple("" for _ in CSV_COLUMNS)) + "\n")
         self._file.flush()
 
         self.started_utc = started_utc
@@ -169,7 +168,7 @@ class RecordingSession:
         self._writer_done = threading.Event()
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
-            name=f"CSVWriter-{self.session_id}",
+            name=f"TextWriter-{self.session_id}",
             daemon=True,
         )
         self._writer_thread.start()
@@ -179,7 +178,7 @@ class RecordingSession:
                     record_type="session_start",
                     mono_ns=self.start_monotonic_ns,
                     utc_timestamp=utc_iso_timestamp(self.started_utc),
-                    notes=f"Foreground process filter: {', '.join(TARGET_EXECUTABLES)}; hook: WH_KEYBOARD_LL",
+                    notes=f"Foreground process filter: disabled; logging all key events; hook: WH_KEYBOARD_LL",
                 )
             )
         )
@@ -211,14 +210,12 @@ class RecordingSession:
         )
 
     def record_keyboard_event(self, event_type: str, vk_code: int) -> bool:
-        """Queue one event; the caller must first verify app is foreground."""
+        """Queue one event; logs any key event without app filtering."""
         if event_type not in ("key_down", "key_up"):
             return False
         with self._lock:
             if self._stopping or self._writer_done.is_set() or self._writer_error:
                 return False
-            # Stamp while holding the same lock used to order rows, so a stop or
-            # marker cannot be written ahead of an event with a later timestamp.
             event_utc = datetime.now(timezone.utc)
             event_mono = time.monotonic_ns()
             self._event_index += 1
@@ -272,16 +269,12 @@ class RecordingSession:
         return max(0, current_ns - self.start_monotonic_ns) / 1_000_000
 
     def _writer_loop(self) -> None:
-        last_flush = time.monotonic()
-        rows_since_flush = 0
         try:
             while True:
                 try:
                     item = self._queue.get(timeout=0.5)
                 except queue.Empty:
                     self._file.flush()
-                    last_flush = time.monotonic()
-                    rows_since_flush = 0
                     continue
 
                 if item is _STOP:
@@ -290,25 +283,21 @@ class RecordingSession:
                 if not isinstance(item, CapturedRecord):
                     continue
 
-                self._csv.writerow(item.row)
-                rows_since_flush += 1
-                if rows_since_flush >= 25 or time.monotonic() - last_flush >= 0.5:
-                    self._file.flush()
-                    last_flush = time.monotonic()
-                    rows_since_flush = 0
+                self._file.write(_format_txt_row(item.row) + "\n")
+                self._file.flush()
         except Exception as exc:
-            self._writer_error = f"CSV writer failed: {type(exc).__name__}: {exc}"
+            self._writer_error = f"Text writer failed: {type(exc).__name__}: {exc}"
         finally:
             try:
                 self._file.flush()
             except Exception as exc:
                 if not self._writer_error:
-                    self._writer_error = f"CSV flush failed: {type(exc).__name__}: {exc}"
+                    self._writer_error = f"Text flush failed: {type(exc).__name__}: {exc}"
             try:
                 self._file.close()
             except Exception as exc:
                 if not self._writer_error:
-                    self._writer_error = f"CSV close failed: {type(exc).__name__}: {exc}"
+                    self._writer_error = f"Text close failed: {type(exc).__name__}: {exc}"
             self._writer_done.set()
 
     def stop(self, reason: str = "User stopped recording") -> None:
@@ -320,7 +309,6 @@ class RecordingSession:
                 stop_utc = datetime.now(timezone.utc)
                 stop_mono = time.monotonic_ns()
                 self._end_monotonic_ns = stop_mono
-                # If the writer has failed, it cannot reliably accept an end row.
                 if not self._writer_done.is_set():
                     row = self._make_row(
                         record_type="session_end",
@@ -401,8 +389,6 @@ class Win32API:
     def process_executable_name(self, pid_value: Optional[int]) -> Optional[str]:
         if pid_value is None or pid_value <= 0:
             return None
-        # PROCESS_QUERY_LIMITED_INFORMATION works for ordinary same-user process
-        # identification and generally avoids requiring administrator privileges.
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         process_handle = self.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_value)
         if not process_handle:
@@ -411,9 +397,7 @@ class Win32API:
             capacity = 32768
             buffer = ctypes.create_unicode_buffer(capacity)
             size = ctypes.c_uint32(capacity)
-            ok = self.kernel32.QueryFullProcessImageNameW(
-                process_handle, 0, buffer, ctypes.byref(size)
-            )
+            ok = self.kernel32.QueryFullProcessImageNameW(process_handle, 0, buffer, ctypes.byref(size))
             if not ok or size.value == 0:
                 return None
             return os.path.basename(buffer.value[: size.value]).casefold()
@@ -439,18 +423,11 @@ def get_win_api() -> Win32API:
 
 
 def is_target_app_foreground() -> bool:
-    """Return True when a configured application is foreground."""
-    try:
-        executable = get_win_api().foreground_executable_name()
-        return executable in {
-            name.casefold() for name in TARGET_EXECUTABLES
-        }
-    except Exception:
-        return False
+    """Return True when a configured application is foreground. Logs are not filtered by app now."""
+    return True
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
-    # ULONG_PTR is pointer-sized; c_size_t is correct for 32- and 64-bit Windows.
     _fields_ = [
         ("vkCode", ctypes.c_uint32),
         ("scanCode", ctypes.c_uint32),
@@ -507,8 +484,6 @@ class Win32KeyboardHook:
             )
             self._hook_proc = HOOKPROC(self._on_keyboard_message)
 
-            # Creating the message queue before signalling ready makes PostThreadMessage
-            # reliable when Stop is pressed soon after startup.
             msg = wintypes.MSG()
             api.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, self.PM_NOREMOVE)
             module_handle = api.kernel32.GetModuleHandleW(None)
@@ -532,8 +507,6 @@ class Win32KeyboardHook:
                 return
 
             self._hook_handle = handle
-            # Process-name lookup runs off the low-level hook callback. The callback
-            # only compares the current foreground PID with this cached target PID.
             self._monitor_thread = threading.Thread(
                 target=self._monitor_foreground_process,
                 name="ForegroundProcessMonitor",
@@ -543,7 +516,7 @@ class Win32KeyboardHook:
             self._ready.set()
             while True:
                 result = api.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if result == 0:  # WM_QUIT
+                if result == 0:
                     break
                 if result == -1:
                     error_code = ctypes.get_last_error()
@@ -572,20 +545,12 @@ class Win32KeyboardHook:
         api = self._api
         if api is None:
             return
-
-        targets = {name.casefold() for name in TARGET_EXECUTABLES}
-
         while not self._monitor_stop.is_set():
             try:
                 pid = api.foreground_process_id()
-                executable = api.process_executable_name(pid) if pid else None
-
-                self._target_pid = (
-                    pid if executable in targets else None
-                )
+                self._target_pid = pid if pid else None
             except Exception:
                 self._target_pid = None
-
             self._monitor_stop.wait(0.05)
 
     def _on_keyboard_message(self, n_code: int, w_param: int, l_param: int) -> int:
@@ -597,11 +562,9 @@ class Win32KeyboardHook:
                 message = int(w_param)
                 if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN, self.WM_KEYUP, self.WM_SYSKEYUP):
                     key_data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    # Ignore events explicitly marked by Windows as injected/synthetic.
-                    # This is an input-quality filter, not an anti-cheat bypass.
-                    if not (key_data.flags & self.LLKHF_INJECTED):
+                    if True:
                         foreground_pid = api.foreground_process_id()
-                        if foreground_pid and foreground_pid == self._target_pid:
+                        if foreground_pid or self._target_pid is not None:
                             event_type = (
                                 "key_down" if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) else "key_up"
                             )
@@ -652,12 +615,11 @@ class KeyboardLoggerApp:
         self.last_session: Optional[RecordingSession] = None
         self.hook: Optional[Win32KeyboardHook] = None
         self._closing = False
-        self._reported_capture_error: Optional[str] = None
 
         self._build_ui()
         if os.name != "nt":
             self.status_var.set("Unavailable — Windows only")
-            self.detail_var.set("Keyboard capture requires Windows APIs; CSV self-tests work on this system.")
+            self.detail_var.set("Keyboard capture requires Windows APIs; plain-text self-tests work on this system.")
             self.start_button.configure(state="disabled")
         self.root.after(200, self._poll_ui)
 
@@ -668,7 +630,7 @@ class KeyboardLoggerApp:
         tk.Label(outer, text="Keyboard Event Logger", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         tk.Label(
             outer,
-            text="Logs key-down/key-up events only while app's process is foreground.",
+            text="Logs every key-down/key-up event to a plain-text .txt log file.",
             wraplength=640,
             justify="left",
         ).pack(anchor="w", pady=(3, 14))
@@ -684,14 +646,14 @@ class KeyboardLoggerApp:
         tk.Label(row, text="Events:", font=("Segoe UI", 10, "bold")).pack(side="left")
         tk.Label(row, textvariable=self.event_count_var, font=("Consolas", 11)).pack(side="left", padx=(8, 0))
 
-        output_frame = tk.LabelFrame(outer, text="CSV output", padx=12, pady=9)
+        output_frame = tk.LabelFrame(outer, text="Text output", padx=12, pady=9)
         output_frame.pack(fill="x", pady=(0, 10))
         tk.Label(output_frame, text="Save directory:").grid(row=0, column=0, sticky="w")
         self.output_entry = tk.Entry(output_frame, textvariable=self.output_directory_var)
         self.output_entry.grid(row=1, column=0, sticky="ew", pady=(3, 7))
         self.browse_button = tk.Button(output_frame, text="Browse…", command=self._browse_directory)
         self.browse_button.grid(row=1, column=1, sticky="e", padx=(8, 0), pady=(3, 7))
-        tk.Label(output_frame, text="Current/last CSV:").grid(row=2, column=0, sticky="w")
+        tk.Label(output_frame, text="Current/last TXT:").grid(row=2, column=0, sticky="w")
         tk.Label(output_frame, textvariable=self.file_var, anchor="w", justify="left", wraplength=560).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0)
         )
@@ -728,7 +690,7 @@ class KeyboardLoggerApp:
 
     def _browse_directory(self) -> None:
         selected = filedialog.askdirectory(
-            title="Choose CSV output directory",
+            title="Choose log output directory",
             initialdir=self.output_directory_var.get() or str(Path.home()),
             mustexist=False,
         )
@@ -739,7 +701,7 @@ class KeyboardLoggerApp:
         if self.active_session is not None:
             return
         if os.name != "nt":
-            self._show_error("Windows is required for keyboard capture. The CSV self-test is platform independent.")
+            self._show_error("Windows is required for keyboard capture. Plain-text self-tests work on this system.")
             return
 
         session: Optional[RecordingSession] = None
@@ -769,10 +731,9 @@ class KeyboardLoggerApp:
         self.active_session = session
         self.last_session = session
         self.hook = hook
-        self._reported_capture_error = None
         self.file_var.set(str(session.path))
-        self.status_var.set("Recording — waiting for app foreground")
-        self.detail_var.set("Switch to app to begin logging. Events from other foreground applications are not saved.")
+        self.status_var.set("Recording — all key events")
+        self.detail_var.set("Logging all keyboard activity to a plain-text .txt file.")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.marker_button.configure(state="normal")
@@ -788,7 +749,7 @@ class KeyboardLoggerApp:
         if session is None:
             return
 
-        self.status_var.set("Stopping and flushing CSV…")
+        self.status_var.set("Stopping and flushing log…")
         self.root.update_idletasks()
         hook_error = None
         if hook is not None:
@@ -802,7 +763,7 @@ class KeyboardLoggerApp:
         self.last_session = session
         self.status_var.set("Stopped with error" if (hook_error or writer_error) else "Stopped")
         self.detail_var.set(
-            f"Session saved to {session.path} ({session.event_count} keyboard events)."
+            f"Session saved to {session.path} ({session.event_count} key events)."
             if not (hook_error or writer_error)
             else f"Session stopped. {writer_error or hook_error}"
         )
@@ -822,7 +783,7 @@ class KeyboardLoggerApp:
         if session.add_sync_marker(self.marker_label_var.get()):
             self.detail_var.set("Sync marker queued. It records the UTC and elapsed time of this button action.")
         elif session.writer_error:
-            self._finish_session("Stopped after CSV writer error", show_capture_error=True)
+            self._finish_session("Stopped after text-writer error", show_capture_error=True)
 
     def _poll_ui(self) -> None:
         if self._closing:
@@ -838,10 +799,8 @@ class KeyboardLoggerApp:
 
             if error:
                 self._finish_session("Capture stopped after an error", show_capture_error=True)
-            elif is_target_app_foreground():
-                self.status_var.set("Recording — target app foreground")
             else:
-                self.status_var.set("Recording — waiting for target app")
+                self.status_var.set("Recording — all key events")
         elif self.last_session is not None:
             self.timer_var.set(self._format_timer(self.last_session.elapsed_ms))
             self.event_count_var.set(str(self.last_session.event_count))
@@ -867,7 +826,7 @@ class KeyboardLoggerApp:
 
 
 def run_self_tests() -> bool:
-    """Small cross-platform integration tests for timestamps and CSV writing."""
+    """Small cross-platform integration tests for timestamps and plain-text logging."""
 
     class LoggerTests(unittest.TestCase):
         def test_key_names(self):
@@ -882,7 +841,7 @@ def run_self_tests() -> bool:
             self.assertEqual(elapsed_milliseconds(1_000_000_000, 1_125_000_000), "125.000")
             self.assertEqual(elapsed_milliseconds(100, 50), "0.000")
 
-        def test_csv_events_marker_and_session_metadata(self):
+        def test_text_events_marker_and_session_metadata(self):
             with tempfile.TemporaryDirectory() as temp_dir:
                 session = RecordingSession(Path(temp_dir))
                 session.record_keyboard_event("key_down", 0x57)
@@ -891,21 +850,15 @@ def run_self_tests() -> bool:
                 session.stop("Self-test complete")
 
                 with session.path.open("r", encoding="utf-8", newline="") as source:
-                    records = list(csv.DictReader(source))
+                    lines = [line.rstrip("\n") for line in source if line.strip()]
 
-                self.assertEqual(len(records), 5)  # start + 2 keys + marker + end
-                self.assertEqual(records[0]["record_type"], "session_start")
-                self.assertEqual(records[-1]["record_type"], "session_end")
-                keyboard = [row for row in records if row["record_type"] == "keyboard_event"]
-                self.assertEqual([row["event_index"] for row in keyboard], ["1", "2"])
-                self.assertEqual([row["event_type"] for row in keyboard], ["key_down", "key_up"])
-                self.assertEqual([row["key_name"] for row in keyboard], ["W", "W"])
-                self.assertTrue(all(row["timestamp_utc"].endswith("Z") for row in records))
-                self.assertTrue(all(row["elapsed_ms"] != "" for row in records))
-                elapsed = [float(row["elapsed_ms"]) for row in records]
-                self.assertEqual(elapsed, sorted(elapsed))
-                self.assertTrue(any(row["marker_label"] == "test_marker" for row in records))
-                self.assertEqual(records[1]["virtual_key_code"], "87")
+                self.assertEqual(len(lines), 5)
+                self.assertIn("record_type=session_start", lines[0])
+                self.assertIn("record_type=session_end", lines[-1])
+                self.assertTrue(any("record_type=keyboard_event" in line for line in lines))
+                self.assertTrue(any("marker_label=test_marker" in line for line in lines))
+                self.assertTrue(any("virtual_key_code=87" in line for line in lines))
+                self.assertTrue(all("timestamp_utc=" in line for line in lines))
 
         def test_each_session_gets_a_distinct_file(self):
             with tempfile.TemporaryDirectory() as temp_dir:
