@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import csv
 import ctypes
 import ctypes.wintypes as wintypes
 import os
@@ -27,8 +26,7 @@ except Exception:  # A missing Tcl/Tk installation should produce a clear error.
 
 
 APP_TITLE = "Multi-APP Keyboard Event Logger"
-TARGET_EXECUTABLES = ()
-CSV_COLUMNS = (
+TEXT_COLUMNS = (
     "session_id",
     "event_index",
     "timestamp_utc",
@@ -128,9 +126,9 @@ def elapsed_milliseconds(start_ns: int, event_ns: int) -> str:
     return f"{max(0, event_ns - start_ns) / 1_000_000:.3f}"
 
 
-def _format_txt_row(row: tuple[str, ...]) -> str:
-    values = dict(zip(CSV_COLUMNS, row))
-    return " | ".join(f"{key}={values.get(key, '')}" for key in CSV_COLUMNS)
+def _format_text_row(row: tuple[str, ...]) -> str:
+    values = dict(zip(TEXT_COLUMNS, row))
+    return " | ".join(f"{key}={values.get(key, '')}" for key in TEXT_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -154,7 +152,7 @@ class RecordingSession:
         self.path = output_directory / filename
 
         self._file = self.path.open("x", encoding="utf-8", newline="")
-        self._file.write(_format_txt_row(tuple("" for _ in CSV_COLUMNS)) + "\n")
+        self._file.write(" | ".join(TEXT_COLUMNS) + "\n")
         self._file.flush()
 
         self.started_utc = started_utc
@@ -178,7 +176,7 @@ class RecordingSession:
                     record_type="session_start",
                     mono_ns=self.start_monotonic_ns,
                     utc_timestamp=utc_iso_timestamp(self.started_utc),
-                    notes=f"Foreground process filter: disabled; logging all key events; hook: WH_KEYBOARD_LL",
+                    notes="Logging all keyboard events to plain text.",
                 )
             )
         )
@@ -210,7 +208,7 @@ class RecordingSession:
         )
 
     def record_keyboard_event(self, event_type: str, vk_code: int) -> bool:
-        """Queue one event; logs any key event without app filtering."""
+        """Queue one event; logs all keys without any app filtering."""
         if event_type not in ("key_down", "key_up"):
             return False
         with self._lock:
@@ -283,7 +281,7 @@ class RecordingSession:
                 if not isinstance(item, CapturedRecord):
                     continue
 
-                self._file.write(_format_txt_row(item.row) + "\n")
+                self._file.write(_format_text_row(item.row) + "\n")
                 self._file.flush()
         except Exception as exc:
             self._writer_error = f"Text writer failed: {type(exc).__name__}: {exc}"
@@ -423,7 +421,7 @@ def get_win_api() -> Win32API:
 
 
 def is_target_app_foreground() -> bool:
-    """Return True when a configured application is foreground. Logs are not filtered by app now."""
+    """App filtering is intentionally disabled for full capture."""
     return True
 
 
@@ -479,9 +477,7 @@ class Win32KeyboardHook:
             api = self._api
             self._thread_id = int(api.kernel32.GetCurrentThreadId())
 
-            HOOKPROC = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t
-            )
+            HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t)
             self._hook_proc = HOOKPROC(self._on_keyboard_message)
 
             msg = wintypes.MSG()
@@ -562,13 +558,11 @@ class Win32KeyboardHook:
                 message = int(w_param)
                 if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN, self.WM_KEYUP, self.WM_SYSKEYUP):
                     key_data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    if True:
-                        foreground_pid = api.foreground_process_id()
-                        if foreground_pid or self._target_pid is not None:
-                            event_type = (
-                                "key_down" if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) else "key_up"
-                            )
-                            self.session.record_keyboard_event(event_type, int(key_data.vkCode))
+                    if not (key_data.flags & self.LLKHF_INJECTED):
+                        event_type = (
+                            "key_down" if message in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) else "key_up"
+                        )
+                        self.session.record_keyboard_event(event_type, int(key_data.vkCode))
         except Exception as exc:
             if self.callback_error is None:
                 self.callback_error = f"Keyboard callback error: {type(exc).__name__}: {exc}"
@@ -619,7 +613,7 @@ class KeyboardLoggerApp:
         self._build_ui()
         if os.name != "nt":
             self.status_var.set("Unavailable — Windows only")
-            self.detail_var.set("Keyboard capture requires Windows APIs; plain-text self-tests work on this system.")
+            self.detail_var.set("Keyboard capture requires Windows APIs; plain-text self-tests still work on this system.")
             self.start_button.configure(state="disabled")
         self.root.after(200, self._poll_ui)
 
@@ -630,7 +624,7 @@ class KeyboardLoggerApp:
         tk.Label(outer, text="Keyboard Event Logger", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         tk.Label(
             outer,
-            text="Logs every key-down/key-up event to a plain-text .txt log file.",
+            text="Logs every key-down/key-up event to a plain-text .txt file.",
             wraplength=640,
             justify="left",
         ).pack(anchor="w", pady=(3, 14))
@@ -701,7 +695,7 @@ class KeyboardLoggerApp:
         if self.active_session is not None:
             return
         if os.name != "nt":
-            self._show_error("Windows is required for keyboard capture. Plain-text self-tests work on this system.")
+            self._show_error("Windows is required for keyboard capture. Plain-text self-tests still work on this system.")
             return
 
         session: Optional[RecordingSession] = None
@@ -853,7 +847,7 @@ def run_self_tests() -> bool:
                     lines = [line.rstrip("\n") for line in source if line.strip()]
 
                 self.assertEqual(len(lines), 5)
-                self.assertIn("record_type=session_start", lines[0])
+                self.assertIn("session_id", lines[0])
                 self.assertIn("record_type=session_end", lines[-1])
                 self.assertTrue(any("record_type=keyboard_event" in line for line in lines))
                 self.assertTrue(any("marker_label=test_marker" in line for line in lines))
